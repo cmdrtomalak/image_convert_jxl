@@ -103,6 +103,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--log-file", type=Path, default=None, help="Optional log file to append structured events.")
     p.add_argument("--cjxl", type=Path, default=Path("cjxl"), help="Path to cjxl binary (or in $PATH).")
     p.add_argument("--djxl", type=Path, default=Path("djxl"), help="Path to djxl binary (for verification).")
+    p.add_argument("--magick", type=Path, default=Path("magick"), help="Path to ImageMagick 'magick' binary (for JPEG decode fallback).")
     p.add_argument("--fail-fast", action="store_true", help="Stop processing on first encode failure.")
     # Fallback / safety options
     p.add_argument("--strict-jpeg", action="store_true", help="Do NOT fallback; fail if reversible JPEG transcode impossible.")
@@ -398,6 +399,7 @@ def encode_one(task: EncodeTask, args, manager: ProcessManager) -> EncodeResult:
     task.dst.parent.mkdir(parents=True, exist_ok=True)
     bytes_in = task.src.stat().st_size
     fallback_used = False
+    fb_note = ''
 
     if manager.terminating():
       return EncodeResult(task=task, ok=True, skipped=True, message='aborted-before-start')
@@ -410,8 +412,8 @@ def encode_one(task: EncodeTask, args, manager: ProcessManager) -> EncodeResult:
       except Exception:
         return EncodeResult(task=task, ok=False, skipped=False, message=f'stale-temp-cannot-remove:{temp_dst}')
 
-    def build_base_cmd(out_path: Path) -> List[str]:
-      base = [str(args.cjxl), str(task.src), str(out_path)]
+    def build_cjxl_cmd(src: Path, out: Path) -> List[str]:
+      base = [str(args.cjxl), str(src), str(out)]
       if args.strip:
         base.append('--strip')
       if args.threads_per_encode > 0:
@@ -420,27 +422,54 @@ def encode_one(task: EncodeTask, args, manager: ProcessManager) -> EncodeResult:
         base.append('--quiet')
       return base
 
-    # Encoding path selection
+    # --- Encoding Logic ---
     if task.src_type == 'jpeg':
-      # Primary attempt: lossless JPEG transcode (reconstructible)
-      cmd = build_base_cmd(temp_dst) + ['--lossless_jpeg=1']
+      # Tier 1: Attempt lossless transcode
+      cmd = build_cjxl_cmd(task.src, temp_dst) + ['--lossless_jpeg=1']
       rc, out, err, elapsed = _run_external(cmd, manager, args.verbose)
-      primary_err_msg = err # Store error message in case fallback also fails
+      primary_err_msg = err
 
-      # If primary fails, and fallback is enabled, try full re-encode.
-      # This handles corrupt JPEGs (e.g. from WhatsApp) that cjxl can't
-      # losslessly transcode but can decode pixels from.
+      # If Tier 1 fails, attempt fallbacks if enabled
       if rc != 0 and args.jpeg_decode_fallback == 'reencode' and not manager.terminating():
-        if temp_dst.exists():
-          try: temp_dst.unlink()
-          except Exception: pass
+        is_decode_failure = b'Getting pixel data failed' in primary_err_msg
 
-        # Fallback to pixel-by-pixel re-encode using --lossless_jpeg=0
-        cmd = build_base_cmd(temp_dst) + ['--lossless_jpeg=0']
-        rc, out, err, elapsed = _run_external(cmd, manager, args.verbose)
-        fallback_used = True
+        # Tier 3: For pure decode failures, use ImageMagick to sanitize to PNG first
+        if is_decode_failure:
+          import tempfile
+          fb_note = 'fallback=magick+reencode'
+          with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp_png:
+            tmp_png_path = Path(tmp_png.name)
+          try:
+            # Use magick to convert broken JPEG to a clean PNG
+            magick_cmd = [str(args.magick), str(task.src), str(tmp_png_path)]
+            rc_magick, out_magick, err_magick, _ = _run_external(magick_cmd, manager, args.verbose)
+            if rc_magick != 0:
+              quarantine_note = _quarantine_on_failure(task, args)
+              err_report = f"magick-failed{quarantine_note}: {err_magick.decode(errors='ignore').strip()}"
+              return EncodeResult(task=task, ok=False, skipped=False, message=err_report)
+
+            # Now, encode the clean PNG with cjxl
+            cmd = build_cjxl_cmd(tmp_png_path, temp_dst) + ['-d', '0']
+            rc, out, err, elapsed = _run_external(cmd, manager, args.verbose)
+            fallback_used = True
+          finally:
+            if tmp_png_path.exists():
+              try: tmp_png_path.unlink()
+              except Exception: pass
+
+        # Tier 2: For other cjxl errors, try re-encoding with --lossless_jpeg=0
+        else:
+          if temp_dst.exists():
+            try: temp_dst.unlink()
+            except Exception: pass
+
+          fb_note = 'fallback=reencode'
+          cmd = build_cjxl_cmd(task.src, temp_dst) + ['--lossless_jpeg=0']
+          rc, out, err, elapsed = _run_external(cmd, manager, args.verbose)
+          fallback_used = True
+
     else: # PNG
-      cmd = build_base_cmd(temp_dst) + ['-d', '0']
+      cmd = build_cjxl_cmd(task.src, temp_dst) + ['-d', '0']
       rc, out, err, elapsed = _run_external(cmd, manager, args.verbose)
 
     # Check for termination signal during encode
@@ -450,15 +479,13 @@ def encode_one(task: EncodeTask, args, manager: ProcessManager) -> EncodeResult:
         except Exception: pass
       return EncodeResult(task=task, ok=True, skipped=True, message='aborted')
 
-    # Check final result code
+    # Check final result code from cjxl
     if rc != 0:
       quarantine_note = _quarantine_on_failure(task, args)
       if fallback_used:
-        # Fallback was used and failed. Report both errors for better diagnostics.
         err_report = f"primary_error='{primary_err_msg.decode(errors='ignore').strip()}' fallback_error='{err.decode(errors='ignore').strip()}'"
-        return EncodeResult(task=task, ok=False, skipped=False, message=f"reencode-fallback-failed{quarantine_note}: {err_report}")
+        return EncodeResult(task=task, ok=False, skipped=False, message=f"fallback-failed{quarantine_note}: {err_report}")
       else:
-        # Primary attempt failed, no fallback attempted or it was disabled.
         return EncodeResult(task=task, ok=False, skipped=False, message=f"cjxl-failed{quarantine_note}: {err.decode(errors='ignore').strip()}")
 
     if not temp_dst.exists():
@@ -528,10 +555,7 @@ def encode_one(task: EncodeTask, args, manager: ProcessManager) -> EncodeResult:
         except Exception as e:
           return EncodeResult(task=task, ok=False, skipped=False, message=f'delete-original-failed: {e}', fallback_used=fallback_used)
 
-    fb_note = ''
-    if fallback_used:
-      fb_note = ' fallback=reencode'
-    msg = f"encoded {bytes_in}->{bytes_out} ratio={bytes_out/bytes_in:.3f} time={elapsed:.2f}s {verify_note}{fb_note}{deletion_note}".strip()
+    msg = f"encoded {bytes_in}->{bytes_out} ratio={bytes_out/bytes_in:.3f} time={elapsed:.2f}s {verify_note} {fb_note}{deletion_note}".strip()
     return EncodeResult(task=task, ok=True, skipped=False, message=msg, bytes_in=bytes_in, bytes_out=bytes_out, fallback_used=fallback_used)
   except Exception as e:
     try:
