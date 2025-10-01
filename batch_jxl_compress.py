@@ -323,8 +323,11 @@ def build_tasks(args) -> Tuple[List[EncodeTask], List[EncodeResult]]:
 
   # Walk
   for dirpath, _dirnames, filenames in os.walk(root):
+    # Prune hidden directories and files
+    _dirnames[:] = [d for d in _dirnames if not d.startswith('.')]
+
     dirpath_p = Path(dirpath)
-    for name in filenames:
+    for name in (f for f in filenames if not f.startswith('.')):
       src = dirpath_p / name
       if src.is_symlink():
         continue  # skip symlinks
@@ -432,8 +435,8 @@ def encode_one(task: EncodeTask, args, manager: ProcessManager) -> EncodeResult:
           try: temp_dst.unlink()
           except Exception: pass
 
-        # Fallback to pixel-by-pixel re-encode
-        cmd = build_base_cmd(temp_dst) + ['-d', '0']
+        # Fallback to pixel-by-pixel re-encode using --lossless_jpeg=0
+        cmd = build_base_cmd(temp_dst) + ['--lossless_jpeg=0']
         rc, out, err, elapsed = _run_external(cmd, manager, args.verbose)
         fallback_used = True
     else: # PNG
