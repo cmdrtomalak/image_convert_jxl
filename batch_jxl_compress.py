@@ -323,8 +323,11 @@ def build_tasks(args) -> Tuple[List[EncodeTask], List[EncodeResult]]:
 
   # Walk
   for dirpath, _dirnames, filenames in os.walk(root):
+    # Prune hidden directories and files
+    _dirnames[:] = [d for d in _dirnames if not d.startswith('.')]
+
     dirpath_p = Path(dirpath)
-    for name in filenames:
+    for name in (f for f in filenames if not f.startswith('.')):
       src = dirpath_p / name
       if src.is_symlink():
         continue  # skip symlinks
