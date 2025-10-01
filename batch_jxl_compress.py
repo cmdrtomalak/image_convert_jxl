@@ -417,96 +417,46 @@ def encode_one(task: EncodeTask, args, manager: ProcessManager) -> EncodeResult:
         base.append('--quiet')
       return base
 
-    motion_photo = task.src_type == 'jpeg' and task.src.name.lower().endswith('.mp.jpg')
-    attempted_primary = False
-    primary_failed_stderr = b''
-
     # Encoding path selection
-    if task.src_type == 'jpeg' and (motion_photo and not args.strict_jpeg):
-      cmd = build_base_cmd(temp_dst) + ['--lossless_jpeg=1', '--allow_jpeg_reconstruction=0']
+    if task.src_type == 'jpeg':
+      # Primary attempt: lossless JPEG transcode (reconstructible)
+      cmd = build_base_cmd(temp_dst) + ['--lossless_jpeg=1']
       rc, out, err, elapsed = _run_external(cmd, manager, args.verbose)
-      if manager.terminating():
-        # abort cleanly
+      primary_err_msg = err # Store error message in case fallback also fails
+
+      # If primary fails, and fallback is enabled, try full re-encode.
+      # This handles corrupt JPEGs (e.g. from WhatsApp) that cjxl can't
+      # losslessly transcode but can decode pixels from.
+      if rc != 0 and args.jpeg_decode_fallback == 'reencode' and not manager.terminating():
         if temp_dst.exists():
           try: temp_dst.unlink()
           except Exception: pass
-        return EncodeResult(task=task, ok=True, skipped=True, message='aborted', fallback_used=True)
-      if rc != 0:
-        return EncodeResult(task=task, ok=False, skipped=False, message=f"cjxl-failed-fallback-motion-photo: {err.decode(errors='ignore').strip()}")
-      fallback_used = True
-    else:
-      if task.src_type == 'jpeg':
-        cmd_primary = build_base_cmd(temp_dst) + ['--lossless_jpeg=1']
-        rc, out, err, elapsed = _run_external(cmd_primary, manager, args.verbose)
-        attempted_primary = True
-        if rc != 0:
-          primary_failed_stderr = err
-          recon_err = b'JPEG bitstream reconstruction data could not be created' in primary_failed_stderr
-          decode_fail = b'Getting pixel data failed' in primary_failed_stderr
-          if recon_err and not args.strict_jpeg:
-            # cleanup partial temp
-            if temp_dst.exists():
-              try: temp_dst.unlink()
-              except Exception: pass
-            cmd_fb = build_base_cmd(temp_dst) + ['--lossless_jpeg=1', '--allow_jpeg_reconstruction=0']
-            rc2, out2, err2, elapsed = _run_external(cmd_fb, manager, args.verbose)
-            if manager.terminating():
-              if temp_dst.exists():
-                try: temp_dst.unlink()
-                except Exception: pass
-              return EncodeResult(task=task, ok=True, skipped=True, message='aborted', fallback_used=True)
-            if rc2 != 0:
-              # Fallback also failed. If pixel decode failure & policy=reencode, attempt -d 0 encode.
-              if (b'Getting pixel data failed' in err2) and args.jpeg_decode_fallback == 'reencode' and not manager.terminating():
-                if temp_dst.exists():
-                  try: temp_dst.unlink()
-                  except Exception: pass
-                cmd_re = build_base_cmd(temp_dst) + ['-d', '0']
-                rc_re, out_re, err_re, elapsed = _run_external(cmd_re, manager, args.verbose)
-                if manager.terminating():
-                  if temp_dst.exists():
-                    try: temp_dst.unlink()
-                    except Exception: pass
-                  return EncodeResult(task=task, ok=True, skipped=True, message='aborted', fallback_used=True)
-                if rc_re != 0:
-                  quarantine_note = _quarantine_on_failure(task, args)
-                  return EncodeResult(task=task, ok=False, skipped=False, message=f"decode-failed-reencode-failed{quarantine_note}: {err_re.decode(errors='ignore').strip()}")
-                fallback_used = True
-              else:
-                quarantine_note = _quarantine_on_failure(task, args)
-                return EncodeResult(task=task, ok=False, skipped=False, message=f"cjxl-failed-fallback{quarantine_note}: {err2.decode(errors='ignore').strip()}")
-            fallback_used = True
-          else:
-            # Primary failed without reversible reconstruction scenario
-            decode_fail = b'Getting pixel data failed' in primary_failed_stderr
-            if decode_fail and args.jpeg_decode_fallback == 'reencode' and not manager.terminating():
-              if temp_dst.exists():
-                try: temp_dst.unlink()
-                except Exception: pass
-              cmd_re2 = build_base_cmd(temp_dst) + ['-d', '0']
-              rc_re2, out_re2, err_re2, elapsed = _run_external(cmd_re2, manager, args.verbose)
-              if manager.terminating():
-                if temp_dst.exists():
-                  try: temp_dst.unlink()
-                  except Exception: pass
-                return EncodeResult(task=task, ok=True, skipped=True, message='aborted')
-              if rc_re2 != 0:
-                quarantine_note = _quarantine_on_failure(task, args)
-                return EncodeResult(task=task, ok=False, skipped=False, message=f"decode-failed-reencode-failed{quarantine_note}: {err_re2.decode(errors='ignore').strip()}")
-              fallback_used = True
-            else:
-              quarantine_note = _quarantine_on_failure(task, args) if decode_fail else ''
-              return EncodeResult(task=task, ok=False, skipped=False, message=f"cjxl-failed{quarantine_note}: {err.decode(errors='ignore').strip()}")
-      else:
+
+        # Fallback to pixel-by-pixel re-encode
         cmd = build_base_cmd(temp_dst) + ['-d', '0']
         rc, out, err, elapsed = _run_external(cmd, manager, args.verbose)
-        if manager.terminating():
-          if temp_dst.exists():
-            try: temp_dst.unlink()
-            except Exception: pass
-          return EncodeResult(task=task, ok=True, skipped=True, message='aborted')
-        if rc != 0:
-          return EncodeResult(task=task, ok=False, skipped=False, message=f"cjxl-failed: {err.decode(errors='ignore').strip()}")
+        fallback_used = True
+    else: # PNG
+      cmd = build_base_cmd(temp_dst) + ['-d', '0']
+      rc, out, err, elapsed = _run_external(cmd, manager, args.verbose)
+
+    # Check for termination signal during encode
+    if manager.terminating():
+      if temp_dst.exists():
+        try: temp_dst.unlink()
+        except Exception: pass
+      return EncodeResult(task=task, ok=True, skipped=True, message='aborted')
+
+    # Check final result code
+    if rc != 0:
+      quarantine_note = _quarantine_on_failure(task, args)
+      if fallback_used:
+        # Fallback was used and failed. Report both errors for better diagnostics.
+        err_report = f"primary_error='{primary_err_msg.decode(errors='ignore').strip()}' fallback_error='{err.decode(errors='ignore').strip()}'"
+        return EncodeResult(task=task, ok=False, skipped=False, message=f"reencode-fallback-failed{quarantine_note}: {err_report}")
+      else:
+        # Primary attempt failed, no fallback attempted or it was disabled.
+        return EncodeResult(task=task, ok=False, skipped=False, message=f"cjxl-failed{quarantine_note}: {err.decode(errors='ignore').strip()}")
 
     if not temp_dst.exists():
       return EncodeResult(task=task, ok=False, skipped=False, message='temp-destination-missing-after-encode', fallback_used=fallback_used)
@@ -577,7 +527,7 @@ def encode_one(task: EncodeTask, args, manager: ProcessManager) -> EncodeResult:
 
     fb_note = ''
     if fallback_used:
-      fb_note = ' fallback=allow-no-recon(motion-photo)' if (task.src_type == 'jpeg' and task.src.name.lower().endswith('.mp.jpg')) else ' fallback=allow-no-recon'
+      fb_note = ' fallback=reencode'
     msg = f"encoded {bytes_in}->{bytes_out} ratio={bytes_out/bytes_in:.3f} time={elapsed:.2f}s {verify_note}{fb_note}{deletion_note}".strip()
     return EncodeResult(task=task, ok=True, skipped=False, message=msg, bytes_in=bytes_in, bytes_out=bytes_out, fallback_used=fallback_used)
   except Exception as e:
