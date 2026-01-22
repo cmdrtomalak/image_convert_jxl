@@ -104,10 +104,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cjxl", type=Path, default=Path("cjxl"), help="Path to cjxl binary (or in $PATH).")
     p.add_argument("--djxl", type=Path, default=Path("djxl"), help="Path to djxl binary (for verification).")
     p.add_argument("--magick", type=Path, default=Path("magick"), help="Path to ImageMagick 'magick' binary (for JPEG decode fallback).")
+    p.add_argument("--exiftool", type=Path, default=Path("exiftool"), help="Path to exiftool binary (to copy metadata when re-encoding).")
     p.add_argument("--fail-fast", action="store_true", help="Stop processing on first encode failure.")
     # Fallback / safety options
     p.add_argument("--strict-jpeg", action="store_true", help="Do NOT fallback; fail if reversible JPEG transcode impossible.")
     p.add_argument("--force-delete-fallback", action="store_true", help="Allow deleting originals even when fallback (non-reconstructible) path used.")
+    p.add_argument("--force-reencode", action="store_true", help="Force pixel-based re-encoding (Tier 2) even for JPEGs that could be transcoded.")
     p.add_argument("--version", action="store_true", help="Print tool version and exit.")
     p.add_argument("--terminate-grace-seconds", type=float, default=8.0, help="Seconds to wait after Ctrl-C before force kill of encoders.")
     p.add_argument("--terminate-kill-seconds", type=float, default=2.0, help="Additional seconds after SIGTERM before SIGKILL.")
@@ -425,12 +427,22 @@ def encode_one(task: EncodeTask, args, manager: ProcessManager) -> EncodeResult:
     # --- Encoding Logic ---
     if task.src_type == 'jpeg':
       # Tier 1: Attempt lossless transcode
-      cmd = build_cjxl_cmd(task.src, temp_dst) + ['--lossless_jpeg=1']
-      rc, out, err, elapsed = _run_external(cmd, manager, args.verbose)
-      primary_err_msg = err
+      # If forced re-encode is requested, simulate failure of Tier 1 immediately
+      if args.force_reencode:
+        rc = 1
+        primary_err_msg = b"forced-reencode"
+        err = b"forced-reencode"
+        elapsed = 0
+      else:
+        cmd = build_cjxl_cmd(task.src, temp_dst) + ['--lossless_jpeg=1']
+        rc, out, err, elapsed = _run_external(cmd, manager, args.verbose)
+        primary_err_msg = err
 
-      # If Tier 1 fails, attempt fallbacks if enabled
-      if rc != 0 and args.jpeg_decode_fallback == 'reencode' and not manager.terminating():
+      # If Tier 1 fails, attempt fallbacks if enabled (or if forced)
+      # Note: if force_reencode is set, we treat it as if 'reencode' fallback is enabled
+      can_fallback = (args.jpeg_decode_fallback == 'reencode') or args.force_reencode
+
+      if rc != 0 and can_fallback and not manager.terminating():
         is_decode_failure = b'Getting pixel data failed' in primary_err_msg
 
         # Tier 3: For pure decode failures, use ImageMagick to sanitize to PNG first
@@ -490,6 +502,39 @@ def encode_one(task: EncodeTask, args, manager: ProcessManager) -> EncodeResult:
 
     if not temp_dst.exists():
       return EncodeResult(task=task, ok=False, skipped=False, message='temp-destination-missing-after-encode', fallback_used=fallback_used)
+
+    # Post-process: Exiftool copy if fallback used (re-encoding strips metadata)
+    # We do this before 'skip-if-larger' check because metadata adds size, and we want accurate size comparison,
+    # AND we want the final file to have metadata.
+    if fallback_used and not manager.terminating():
+      # Try running exiftool to copy tags
+      # We add -m to ignore minor errors (often needed when adding tags to JXL wrapped in BMFF)
+      exif_cmd = [str(args.exiftool), '-m', '-overwrite_original', '-TagsFromFile', str(task.src), str(temp_dst)]
+      if not args.verbose:
+        exif_cmd.append('-q') # quiet
+
+      # We don't use _run_external with ProcessManager for exiftool because it's fast and we don't want to overcomplicate cancellation
+      # (ProcessManager kills long running cjxl). But we should respect stop_flag if possible.
+      try:
+        # Check if exiftool is installed/runnable first?
+        # We assume if they provided path (default 'exiftool') it should work.
+        # If it fails (e.g. not found), we should probably warn but proceed?
+        # User requirement: "ensure exif are not lost". So failure here might be critical.
+        # However, we catch exceptions.
+
+        # Run synchronous
+        ec_res = subprocess.run(exif_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if ec_res.returncode == 0:
+            fb_note += '+exif'
+        else:
+             # If exiftool fails, we might still want to keep the image, but warn.
+             # Or treat as partial failure?
+             # For now, append to message.
+             fb_note += f'+exif-failed({ec_res.stderr.decode(errors="ignore").strip()})'
+      except FileNotFoundError:
+          fb_note += '+exif-not-found'
+      except Exception as e:
+          fb_note += f'+exif-exc({e})'
 
     bytes_out = temp_dst.stat().st_size
     if args.skip_if_larger and bytes_out >= bytes_in:
